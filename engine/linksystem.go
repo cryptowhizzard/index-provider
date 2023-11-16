@@ -127,7 +127,8 @@ func (e *Engine) mkLinkSystem() ipld.LinkSystem {
 			}
 			if regeneratedLink == nil || !c.Equals(regeneratedLink.(cidlink.Link).Cid) {
 				log.Errorw("Regeneration of entries link from multihash iterator did not match the original link. Check that multihash iterator consistently returns the same entries for the same key.", "want", lnk, "got", regeneratedLink)
-				return nil, ErrEntriesLinkMismatch
+				// return nil, ErrEntriesLinkMismatch // Do not return this to the Indexer. It causes an abort. When it does not match better return not found and skip to the next one on ingestion.
+				return nil, datastore.ErrNotFound
 			}
 		} else {
 			log.Debugw("Found cache entry for CID", "cid", c)
