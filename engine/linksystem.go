@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"io"
-
+	"time"
+	"context"
 	"github.com/ipfs/go-datastore"
 	"github.com/ipld/go-ipld-prime"
 	"github.com/ipld/go-ipld-prime/codec/dagjson"
@@ -84,52 +85,47 @@ func (e *Engine) mkLinkSystem() ipld.LinkSystem {
 		// car.  So all entry chunks are kept in cache to serve to the indexer.
 		// The cache uses the entry chunk CID as a key that maps to the entry
 		// chunk data.
-		if b == nil {
-			log.Infow("Entry for CID is not cached, generating chunks", "cid", c)
-			// If the link is not found, it means that the root link of the list has
-			// not been generated and we need to get the relationship between the cid
-			// received and the contextID so the lister knows how to
-			// regenerate the list of CIDs. It's enough to fetch *any* provider's mapping
-			// as same entries from different providers would result into the same chunks
-			key, err := e.getCidKeyMap(ctx, c)
-			if err != nil {
-				if errors.Is(err, datastore.ErrNotFound) {
-					log.Error("No mapping between CID and contextID to provider identity found. Treating ad as skippable.")
-					// We have to return ipld.ErrNotExists because the version of storetheindex Boost is using depends
-					// on the old HTTP publisher that only treats this error as 404.
-					return nil, ipld.ErrNotExists{}
-				}
-				log.Errorf("Error fetching relationship between CID and contextID: %s", err)
-				return nil, err
-			}
+if b == nil {
+    log.Infow("Entry for CID is not cached, generating chunks", "cid", c)
 
-			// Get the car iterator needed to create the entry chunks.
-			// Normally for removal this is not needed since the indexer
-			// deletes all indexes for the contextID in the removal
-			// advertisement.  Only if the removal had no contextID would the
-			// indexer ask for entry chunks to remove.
-			provider, err := peer.IDFromBytes(key.Provider)
-			if err != nil {
-				return nil, err
-			}
-			mhIter, err := e.mhLister(ctx, provider, key.ContextID)
-			if err != nil {
-				return nil, err
-			}
+    // Create a context with a 10-second timeout
+    timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+    defer cancel()
 
-			// Store the linked list entries in cache as we generate them.  We
-			// use the cache linksystem that stores entries in an in-memory
-			// datastore.
-			regeneratedLink, err := e.entriesChunker.Chunk(ctx, mhIter)
-			if err != nil {
-				log.Errorf("Error generating linked list from multihash lister: %s", err)
-				return nil, err
-			}
-			if regeneratedLink == nil || !c.Equals(regeneratedLink.(cidlink.Link).Cid) {
-				log.Errorw("Regeneration of entries link from multihash iterator did not match the original link. Check that multihash iterator consistently returns the same entries for the same key.", "want", lnk, "got", regeneratedLink)
-				// return nil, ErrEntriesLinkMismatch // Do not return this to the Indexer. It causes an abort. When it does not match better return not found and skip to the next one on ingestion.
-				return nil, datastore.ErrNotFound
-			}
+    // Use this timeoutCtx for the subsequent operations
+    key, err := e.getCidKeyMap(timeoutCtx, c)
+    if err != nil {
+        if errors.Is(err, datastore.ErrNotFound) {
+            log.Error("No mapping between CID and contextID to provider identity found. Treating ad as skippable.")
+            return nil, ipld.ErrNotExists{}
+        }
+        log.Errorf("Error fetching relationship between CID and contextID: %s", err)
+        return nil, err
+    }
+
+    provider, err := peer.IDFromBytes(key.Provider)
+    if err != nil {
+        return nil, err
+    }
+    mhIter, err := e.mhLister(timeoutCtx, provider, key.ContextID)
+    if err != nil {
+        return nil, err
+    }
+
+    regeneratedLink, err := e.entriesChunker.Chunk(timeoutCtx, mhIter)
+    if err != nil {
+        if timeoutCtx.Err() == context.DeadlineExceeded {
+            log.Error("Timeout occurred during chunk generation")
+            return nil, timeoutCtx.Err() // or return a custom error
+        }
+        log.Errorf("Error generating linked list from multihash lister: %s", err)
+        return nil, err
+    }
+    if regeneratedLink == nil || !c.Equals(regeneratedLink.(cidlink.Link).Cid) {
+        log.Errorw("Regeneration of entries link from multihash iterator did not match the original link. Check that multihash iterator consistently returns the same entries for the same key.", "want", lnk, "got", regeneratedLink)
+        return nil, datastore.ErrNotFound // This is not usefull and halts on Indexing -> return nil, ErrEntriesLinkMismatch
+    }
+
 		} else {
 			log.Debugw("Found cache entry for CID", "cid", c)
 		}
