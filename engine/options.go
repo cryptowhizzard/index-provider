@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"net/url"
 
-	datatransfer "github.com/filecoin-project/go-data-transfer/v2"
 	"github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
+	"github.com/ipld/go-ipld-prime"
 	_ "github.com/ipni/go-libipni/maurl"
 	"github.com/ipni/index-provider/engine/chunker"
 	"github.com/ipni/index-provider/engine/policy"
@@ -24,13 +24,6 @@ const (
 	// all advertisements are only stored locally.
 	NoPublisher PublisherKind = ""
 
-	// DataTransferPublisher exposes a datatransfer/graphsync server that
-	// allows peers in the network to sync advertisements.
-	//
-	// This option is being discontinued. Only provided as a fallback in case
-	// HttpPublisher is not working.
-	DataTransferPublisher PublisherKind = "dtsync"
-
 	// HttpPublisher exposes an HTTP server that serves advertisements using an
 	// HTTP server.
 	HttpPublisher PublisherKind = "http"
@@ -42,12 +35,15 @@ const (
 	// engine's libp2p host. This is just the combination of HttpPublisher and
 	// Libp2pPublisher configurable as a single option.
 	Libp2pHttpPublisher PublisherKind = "libp2phttp"
+
+	// Deprecated. Use Libp2pPublisher.
+	DataTransferPublisher PublisherKind = "dtsync"
 )
 
 type (
 	// PublisherKind represents the kind of publisher to use in order to announce a new
 	// advertisement to the network.
-	// See: WithPublisherKind, NoPublisher, DataTransferPublisher, HttpPublisher.
+	// See: WithPublisherKind
 	PublisherKind string
 
 	// Option sets a configuration parameter for the provider engine.
@@ -56,10 +52,6 @@ type (
 	options struct {
 		ds datastore.Batching
 		h  host.Host
-
-		// announceURLs is the list of indexer URLs to send direct HTTP
-		// announce messages to.
-		announceURLs []*url.URL
 
 		// key is always initialized from the host peerstore.
 		// Setting an explicit identity must not be exposed unless it is tightly coupled with the
@@ -76,24 +68,37 @@ type (
 		// default configured provider will be assumed.
 		provider peer.AddrInfo
 
+		// ---- publisher config ----
+
 		pubKind PublisherKind
-		pubDT   datatransfer.Manager
 		// pubHttpAnnounceAddrs are the addresses that are put into announce
-		// messages to tell the indexer the addresses where advertisement are
-		// published.
+		// messages to tell indexers the addresses to fetch advertisements
+		// from.
 		pubHttpAnnounceAddrs []multiaddr.Multiaddr
 		pubHttpListenAddr    string
 		pubHttpWithoutServer bool
 		pubHttpHandlerPath   string
 		pubTopicName         string
 		pubTopic             *pubsub.Topic
-		pubExtraGossipData   []byte
+
+		// ---- announce sender config ----
+
+		// announceURLs enables sending direct announcements via HTTP. This is
+		// the list of indexer URLs to send direct HTTP announce messages to.
+		announceURLs []*url.URL
+		// pubsubAnnounce enables broadcasting announcements via gossip pubsub.
+		pubsubAnnounce bool
+		// pubsubExtraGossipData supplies extra data to include in pubsub
+		// announcements.
+		pubsubExtraGossipData []byte
 
 		entCacheCap int
 		purgeCache  bool
 		chunker     chunker.NewChunkerFunc
 
 		syncPolicy *policy.Policy
+
+		storageReadOpenerErrorHook func(lctx ipld.LinkContext, lnk ipld.Link, err error) error
 	}
 )
 
@@ -102,6 +107,7 @@ func newOptions(o ...Option) (*options, error) {
 		pubKind:           NoPublisher,
 		pubHttpListenAddr: "0.0.0.0:3104",
 		pubTopicName:      "/indexer/ingest/mainnet",
+		pubsubAnnounce:    true,
 		// Keep 1024 ad entry DAG in cache; note, the size on disk depends on DAG format and
 		// multihash code.
 		entCacheCap: 1024,
@@ -242,6 +248,13 @@ func WithEntriesCacheCapacity(s int) Option {
 // See: PublisherKind.
 func WithPublisherKind(k PublisherKind) Option {
 	return func(o *options) error {
+		switch k {
+		case NoPublisher, HttpPublisher, Libp2pPublisher, Libp2pHttpPublisher:
+		case DataTransferPublisher:
+			return fmt.Errorf("publisher kind %q is no longer supported", DataTransferPublisher)
+		default:
+			return fmt.Errorf("unknown publisher kind %q, expecting one of %v", k, []PublisherKind{HttpPublisher, Libp2pPublisher, Libp2pHttpPublisher})
+		}
 		o.pubKind = k
 		return nil
 	}
@@ -282,7 +295,7 @@ func WithHttpPublisherHandlerPath(handlerPath string) Option {
 // WithHttpPublisherAnnounceAddr sets the address to be supplied in announce
 // messages to tell indexers where to retrieve advertisements.
 //
-// This option only takes effect if the PublisherKind is set to HttpPublisher.
+// This option is not used if PublisherKind is set to DataTransferPublisher.
 func WithHttpPublisherAnnounceAddr(addr string) Option {
 	return func(o *options) error {
 		if addr != "" {
@@ -317,18 +330,6 @@ func WithTopicName(t string) Option {
 func WithTopic(t *pubsub.Topic) Option {
 	return func(o *options) error {
 		o.pubTopic = t
-		return nil
-	}
-}
-
-// WithDataTransfer sets the instance of datatransfer.Manager to use.
-// If unspecified a new instance is created automatically.
-//
-// Note that this option only takes effect if the PublisherKind is set to DataTransferPublisher.
-// See: WithPublisherKind.
-func WithDataTransfer(dt datatransfer.Manager) Option {
-	return func(o *options) error {
-		o.pubDT = dt
 		return nil
 	}
 }
@@ -390,20 +391,6 @@ func WithProvider(provider peer.AddrInfo) Option {
 	}
 }
 
-// WithExtraGossipData supplies extra data to include in the pubsub announcement.
-// Note that this option only takes effect if the PublisherKind is set to DataTransferPublisher.
-// See: WithPublisherKind.
-func WithExtraGossipData(extraData []byte) Option {
-	return func(o *options) error {
-		if len(extraData) != 0 {
-			// Make copy for safety.
-			o.pubExtraGossipData = make([]byte, len(extraData))
-			copy(o.pubExtraGossipData, extraData)
-		}
-		return nil
-	}
-}
-
 func WithPrivateKey(key crypto.PrivKey) Option {
 	return func(o *options) error {
 		o.key = key
@@ -421,6 +408,39 @@ func WithDirectAnnounce(announceURLs ...string) Option {
 			}
 			o.announceURLs = append(o.announceURLs, u)
 		}
+		return nil
+	}
+}
+
+// WithPubsubAnnounce configures whether or not announcements are send via
+// gossip pubsub. Default is true if this option is not specified.
+func WithPubsubAnnounce(enable bool) Option {
+	return func(o *options) error {
+		o.pubsubAnnounce = enable
+		return nil
+	}
+}
+
+// WithExtraGossipData supplies extra data to include in the pubsub
+// announcement. Note that this option only takes effect if pubsub
+// announcements are enabled.
+func WithExtraGossipData(extraData []byte) Option {
+	return func(o *options) error {
+		if len(extraData) != 0 {
+			// Make copy for safety.
+			o.pubsubExtraGossipData = make([]byte, len(extraData))
+			copy(o.pubsubExtraGossipData, extraData)
+		}
+		return nil
+	}
+}
+
+// WithStorageReadOpenerErrorHook allows the calling applicaiton to invoke a custom piece logic whenever a storage read opener error occurs.
+// For example the calling application can delete corrupted / create a new advertisement if the datastore was corrupted for some reason.
+// The calling application can return ipld.ErrNotFound{} to indicate IPNI that this advertisement should be skipped without halting processing of the rest of the chain.
+func WithStorageReadOpenerErrorHook(hook func(ipld.LinkContext, ipld.Link, error) error) Option {
+	return func(o *options) error {
+		o.storageReadOpenerErrorHook = hook
 		return nil
 	}
 }
